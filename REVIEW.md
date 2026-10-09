@@ -83,10 +83,10 @@ All of these run against the real MongoDB 7.0.43 and are re-runnable.
 
 | Script | Result |
 |---|---|
-| `python dev_tools/test_rules.py` | **83 passed, 0 failed, 0 skipped** (was 39/4/15) |
-| `python dev_tools/smoke_test.py` | **121 passed, 0 failed** |
-| `python dev_tools/concurrency_test.py` | **42 passed, 0 failed** |
-| `python dev_tools/check_dev_db.py` | **45 passed, 0 failed**, including two restarts with identical indexes |
+| `python dev_tools/test_rules.py` | **102 passed, 0 failed, 0 skipped** (stage 2: 83/0/0) |
+| `python dev_tools/smoke_test.py` | **268 passed, 0 failed** (stage 2: 121) |
+| `python dev_tools/concurrency_test.py` | **109 passed, 0 failed** (stage 2: 42) |
+| `python dev_tools/check_dev_db.py` | **45 passed, 0 failed** |
 | `python dev_tools/audit_starter.py` | 68 probes, **0 defects** (was 60) |
 
 The concurrency evidence, 20 threads, five trials each:
@@ -94,7 +94,13 @@ The concurrency evidence, 20 threads, five trials each:
 ```
 POST /employees       trial 1..5:  1 x 201, 19 x 409, 0 x 500, 1 row stored
 POST /attendance/punch-in  trial 1..5:  1 x 201, 19 x 409, 0 x 500, 1 row stored
+POST /attendance/punch-out trial 1..5:  1 x 200, 19 x 409, 0 x 500
+PATCH, same correction trial 1..5:  1 x 200, 0 x 409, 19 x 422, 0 x 500, history length 1
+PATCH, 20 corrections:  15 x 200, 5 x 409, 0 x 500, history length 15
 ```
+
+The last line is the one that matters for "concurrent regularizations must not silently
+lose each other's history": **15 winners, 15 audit entries, nothing lost.**
 
 and the guarantee underneath it:
 
@@ -105,9 +111,42 @@ two insert_one calls with the same (emp_code, date) -> second raises DuplicateKe
 
 ### Still to do, not yet fixed
 
-- `POST /attendance/punch-out` and `PATCH /attendance/{emp_code}/{date}` do not exist
-  yet. Rows 4, 5 and 6 apply to the code I still have to write, and Stage 3 must not
-  repeat them.
-- The four analytics endpoints do not exist yet, so I cannot yet prove `IXSCAN` versus
-  `COLLSCAN` on `attendance_big`. Rows 8 and 26 predict that every pipeline would
-  COLLSCAN today. **That is a prediction, not a measurement**, until Stage 6.
+- The four analytics endpoints and `GET /admin/explain/{endpoint}` do not exist yet, so I
+  cannot yet prove `IXSCAN` versus `COLLSCAN` on `attendance_big`. Rows 8 and 26 predict
+  that every pipeline would COLLSCAN today. **That is a prediction, not a measurement**,
+  until Stage 6.
+
+---
+
+## Stage 3: the rows above, applied to code I then wrote
+
+Stage 3 added `POST /attendance/punch-out` and `PATCH /attendance/{emp_code}/{date}`.
+Those two endpoints use exactly the helpers the rows above said were broken, so the rows
+became a checklist for the new code rather than history. What each one looks like now:
+
+| Row | Defect | Where it would have shown up in the new code | How I know it is not there |
+|---|---|---|---|
+| 4 | no 30-minute overtime minimum | `compute_hours_fields` calling overtime for a punch-out | `smoke_test.py`: `R3 5 minutes past shift end is under the 30 minute minimum -> 0` |
+| 5 | overnight shift never handled | punch-out and PATCH computing overtime for a 22:00-06:00 shift | `smoke_test.py`: `R3 overnight 06:40 against a 06:00 shift end is 40`, and the PATCH correction gives the same 40 |
+| 6 | naive and aware datetimes mixed | `punch_out - punch_in` on line 734, and `punch_in + MAX_PUNCH_DURATION` on line 736 | every value comes from `MongoClient(tz_aware=True)`, and `test_rules.py` still shows no `TypeError` |
+| 8 | no indexes | picking the record to close would be a collection scan | the filter is an equality on `emp_code` plus a `date` sort, both served by `emp_code_date_unique` |
+| 21 | `punched_at` not strict | `PunchOutBody` would have accepted `"1"` | `smoke_test.py`: six `reject punch-out punched_at ...` cases, all 422 |
+| 23 | check-then-insert race | punch-out is read-then-update, which is exactly that shape | `concurrency_test.py`: `1 x 200, 19 x 409` over five trials |
+| 24 | instants not truncated | `punch_out` would keep its milliseconds and R1's rules would drift | `truncate_seconds` runs at line 707 and inside the PATCH helper at line 450 |
+| 25 | `_id` leaks | returning the raw document from either endpoint | both return `record_to_api(...)`, and `smoke_test.py` asserts no `id` and no `_id` |
+| 30 | legacy documents come back incomplete | PATCH on a record with no `history` and no `half_day` | `smoke_test.py`: `...and now has exactly one history entry` and `...and the missing half_day was filled in` |
+
+### Two new problems this stage introduced, and how they were caught
+
+1. **`current_state` used `record.get("half_day")` with no default.** A legacy document with
+   no `half_day` would then compare `None != False`, so a correction that changed nothing
+   would be recorded as a change and the contract's "a request that changes nothing is 422"
+   would never fire for those records. Caught by `test_rules.py`'s
+   *"a missing half_day reads as false"* case. Fixed by using the same defaults as
+   `record_to_api`.
+2. **The punch-out lookup did not exclude `ABSENT` records.** In MongoDB `null` sorts below
+   every date, so `{punch_in: {"$lte": <a date>}}` also matches a record whose `punch_in` is
+   `null` - or has no `punch_in` field at all. The most recent `ABSENT` day would have been
+   picked as the record to close, and the code would then have subtracted from `None`:
+   **a 500**. Fixed with `{"punch_in": {"$type": "date", "$lte": punch_dt}}` at line 720 and
+   proved by `smoke_test.py`'s *"punch-out cannot pick an ABSENT record -> 404"*.

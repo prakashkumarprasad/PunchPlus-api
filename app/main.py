@@ -81,6 +81,21 @@ DEFAULT_SHIFT_END = "18:30"
 # plain number, so they need converting to epoch milliseconds too.
 HISTORY_TIME_FIELDS = ["punch_in", "punch_out"]
 
+# ABSENT and LEAVE mean "did not work": both punch times stay null and every
+# derived number is a zero. No punch-in may create them, only seeded back-office
+# data or a correction (PATCH) may.
+NON_PRESENT_STATUSES = ["ABSENT", "LEAVE"]
+
+# The seven fields a regularization is allowed to change, in the order
+# DATA_MODEL.md section 4 lists them. A history entry gets one key per field
+# here whose value actually changed.
+CHANGEABLE_FIELDS = ["status", "punch_in", "punch_out", "work_hours",
+                     "late_minutes", "overtime_minutes", "half_day"]
+
+# A punch-out (and a corrected punch_out) must be within 24 hours of the
+# punch-in. Exactly 24 hours is still allowed; more is 422.
+MAX_PUNCH_DURATION = timedelta(hours=24)
+
 # Date strings must look like YYYY-MM-DD. The regex is checked BEFORE
 # date.fromisoformat(), because Python 3.11+ also accepts 20260101 and
 # 2026-W01-1 and we do not want those.
@@ -356,6 +371,111 @@ def build_attendance_query(
     return query, sort, skip, page_size
 
 
+def compute_hours_fields(punch_in, punch_out, date_str, shift_start, shift_end):
+    """R3, R4 and R5 for one record: the three numbers punch-out produces.
+
+    A record that is still open has no hours yet, so it keeps the defaults
+    DATA_MODEL.md gives it: null hours, 0 overtime and no half day.
+    """
+    if punch_out is None:
+        return {"work_hours": None, "overtime_minutes": 0, "half_day": False}
+
+    work_hours = compute_work_hours(punch_in, punch_out)
+    return {
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime_minutes(
+            punch_out, date_str, shift_start, shift_end
+        ),
+        # R5 compares the ROUNDED hours, which is why it takes the value
+        # compute_work_hours already rounded rather than the raw seconds.
+        "half_day": compute_half_day(work_hours),
+    }
+
+
+def current_state(record: dict) -> dict:
+    """The seven changeable fields of a record, exactly as they are stored now.
+
+    The defaults are the ones DATA_MODEL.md promises for a legacy document
+    (missing late/overtime means 0, missing half_day means false), and they are
+    the same defaults `record_to_api` uses. That matters: the "from" side of an
+    audit entry has to be the value the API would have reported anyway, or a
+    correction that changes nothing would look like it changed something.
+    """
+    return {
+        "status": record.get("status"),
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "work_hours": record.get("work_hours"),
+        "late_minutes": record.get("late_minutes", 0),
+        "overtime_minutes": record.get("overtime_minutes", 0),
+        "half_day": record.get("half_day", False),
+    }
+
+
+def build_changes(before: dict, after: dict) -> dict:
+    """One {from, to} pair for every field whose value actually changed.
+
+    The comparison is on the final values, so a field the client did not send
+    still appears when recomputing it produced a different number.
+    """
+    changes = {}
+    for field_name in CHANGEABLE_FIELDS:
+        old_value = before.get(field_name)
+        new_value = after.get(field_name)
+        if old_value != new_value:
+            changes[field_name] = {"from": old_value, "to": new_value}
+    return changes
+
+
+def resolve_regularized_times(record: dict, new_status: str, date_str: str,
+                              employee: dict, sent_punch_in, sent_punch_out):
+    """The punch_in and punch_out the record should have after a correction.
+
+    `sent_punch_in` and `sent_punch_out` are raw epoch milliseconds from the
+    request body, or None when the client did not send that field. Everything
+    that breaks one of the contract's rules is a 422.
+    """
+    stored_punch_in = record.get("punch_in")
+    stored_punch_out = record.get("punch_out")
+
+    # ABSENT and LEAVE carry no punch times at all, so a client that sends one
+    # along with the status has contradicted itself.
+    if new_status in NON_PRESENT_STATUSES:
+        if sent_punch_in is not None or sent_punch_out is not None:
+            raise HTTPException(422, "status ABSENT or LEAVE cannot have punch times")
+        return None, None
+
+    # A presence status needs a punch_in: sent here, or already stored.
+    if sent_punch_in is not None:
+        punch_in = truncate_seconds(ms_to_dt(sent_punch_in))
+    elif stored_punch_in is not None:
+        punch_in = stored_punch_in
+    else:
+        raise HTTPException(422, "a presence status requires a punch_in")
+
+    if sent_punch_out is not None:
+        punch_out = truncate_seconds(ms_to_dt(sent_punch_out))
+    else:
+        punch_out = stored_punch_out
+
+    # R1 again: correcting a punch time must not move the record to another day.
+    # This is the overnight-aware form, because attendance_date_for knows the
+    # employee's shift.
+    new_date = attendance_date_for(
+        punch_in, employee["shift_start"], employee["shift_end"]
+    )
+    if new_date != date_str:
+        raise HTTPException(422, "punch_in does not belong to this attendance date")
+
+    if punch_out is not None:
+        if punch_out <= punch_in:
+            raise HTTPException(422, "punch_out must be after punch_in")
+        if punch_out > punch_in + MAX_PUNCH_DURATION:
+            raise HTTPException(422, "punch_out must be within 24 hours of punch_in")
+
+    return punch_in, punch_out
+
+
 # --------------------------------------------------------------------------- #
 # 5. REQUEST MODELS
 # --------------------------------------------------------------------------- #
@@ -403,6 +523,38 @@ class PunchInBody(BaseModel):
     )
     # Only the three presence statuses may be created by a punch-in.
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+class PunchOutBody(BaseModel):
+    """Body of POST /attendance/punch-out."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: str
+    # Same strict integer and same range as punch-in: the contract says a value
+    # that looks like seconds must be 422 here too.
+    punched_at: Optional[StrictInt] = Field(
+        default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS
+    )
+
+
+class RegularizeBody(BaseModel):
+    """Body of PATCH /attendance/{emp_code}/{date}.
+
+    `reason` and `regularized_by` are always required because every
+    regularization is written into the audit trail. The three fields being
+    corrected are all optional: an omitted field means "leave it alone".
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Unlike punch-in, a correction may create ABSENT and LEAVE, so all five
+    # statuses are allowed here.
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[StrictInt] = Field(default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+    punch_out: Optional[StrictInt] = Field(default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 
 # --------------------------------------------------------------------------- #
@@ -539,10 +691,170 @@ def list_attendance(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+@app.post("/attendance/punch-out", tags=["attendance"])
+def punch_out(body: PunchOutBody):
+    """Close the employee's most recent record, applying R3, R4 and R5."""
+    employee = db.employees.find_one({"emp_code": body.emp_code})
+    if employee is None:
+        raise HTTPException(404, "unknown emp_code")
+
+    # Compare with None, never with truthiness, exactly as punch-in does.
+    if body.punched_at is None:
+        punch_dt = datetime.now(UTC)
+    else:
+        punch_dt = ms_to_dt(body.punched_at)
+    # R1: truncate to whole seconds before anything is calculated or stored.
+    punch_dt = truncate_seconds(punch_dt)
+
+    # The record to close is the most recent one whose punch_in is at or before
+    # this punch-out. `date` desc is the right order here, because `date` is
+    # the IST day the shift started and it is what the (emp_code, date) index
+    # already sorts by.
+    #
+    # `$type: "date"` matters: in MongoDB a null sorts below every date, so an
+    # ABSENT or LEAVE record (punch_in null, or missing on an old document)
+    # would otherwise match `$lte` and get picked as the record to close.
+    record = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$type": "date", "$lte": punch_dt},
+        },
+        sort=[("date", -1)],
+    )
+    if record is None:
+        raise HTTPException(404, "no punch-in at or before punched_at")
+
+    # 409 comes before the 422 time checks. If the day is already closed there
+    # is nothing left to check the times against, and the conflict is the more
+    # specific answer.
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, "that record is already punched out")
+
+    punch_in = record["punch_in"]
+    if punch_dt <= punch_in:
+        raise HTTPException(422, "punched_at must be after punch_in")
+    if punch_dt > punch_in + MAX_PUNCH_DURATION:
+        raise HTTPException(422, "punched_at must be within 24 hours of punch_in")
+
+    values_to_set = {"punch_out": punch_dt}
+    values_to_set.update(
+        compute_hours_fields(
+            punch_in, punch_dt, record["date"],
+            employee["shift_start"], employee["shift_end"],
+        )
+    )
+
+    # Compare-and-set. The filter repeats the punch_in that was just read, so if
+    # another request closed this record in between, nothing matches the filter,
+    # matched_count is 0, and this request answers 409 instead of overwriting it.
+    result = db.attendance_logs.update_one(
+        {
+            "emp_code": body.emp_code,
+            "date": record["date"],
+            "punch_in": punch_in,
+            "punch_out": None,
+        },
+        {"$set": values_to_set},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(409, "that record was punched out by someone else")
+
+    # The compare-and-set just proved these values are the stored ones, so the
+    # response is built from the record we read plus what we just wrote.
+    updated = dict(record)
+    updated.update(values_to_set)
+    return record_to_api(updated)
+
+
+@app.patch("/attendance/{emp_code}/{date}", tags=["attendance"])
+def regularize(emp_code: str, date: str, body: RegularizeBody):
+    """Correct one day's record, recompute the derived fields, log the change.
+
+    The parameter named `date` shadows the `datetime.date` class inside this
+    function. That is deliberate: the contract's path is
+    /attendance/{emp_code}/{date}, so FastAPI needs that exact name. Nothing in
+    this function needs the class, and the helper below takes `date_str`.
+    """
+    if not is_valid_date_string(date):
+        raise HTTPException(422, "date must be a real date in YYYY-MM-DD format")
+
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if employee is None:
+        raise HTTPException(404, "unknown emp_code")
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # A field the client omitted means "leave it alone". Comparing with None
+    # (never with truthiness) keeps 0 from looking like "not supplied".
+    new_status = body.status if body.status is not None else record.get("status")
+    new_punch_in, new_punch_out = resolve_regularized_times(
+        record, new_status, date, employee, body.punch_in, body.punch_out
+    )
+
+    # Recompute R2 - R5 from the final state, not from the old numbers.
+    if new_punch_in is None:
+        derived = {"late_minutes": 0, "work_hours": None,
+                   "overtime_minutes": 0, "half_day": False}
+    else:
+        derived = {
+            "late_minutes": compute_late_minutes(
+                new_punch_in, date, employee["shift_start"]
+            )
+        }
+        derived.update(
+            compute_hours_fields(
+                new_punch_in, new_punch_out, date,
+                employee["shift_start"], employee["shift_end"],
+            )
+        )
+
+    before = current_state(record)
+    after = dict(before)
+    after["status"] = new_status
+    after["punch_in"] = new_punch_in
+    after["punch_out"] = new_punch_out
+    after.update(derived)
+
+    # `changes` holds only the fields that really moved, so a request that
+    # changes nothing is detectable. The contract calls that a 422.
+    changes = build_changes(before, after)
+    if changes == {}:
+        raise HTTPException(422, "the request changes nothing")
+
+    entry = {
+        "at": datetime.now(UTC),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # One compare-and-set does everything: the filter carries the record key and
+    # the three values that were just read, `$set` writes the new values, and
+    # `$push` appends the audit entry. The history array is never read back and
+    # rewritten, so two concurrent corrections cannot overwrite each other.
+    result = db.attendance_logs.update_one(
+        {
+            "emp_code": emp_code,
+            "date": date,
+            "status": before["status"],
+            "punch_in": before["punch_in"],
+            "punch_out": before["punch_out"],
+        },
+        {"$set": after, "$push": {"history": entry}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(409, "the record changed while this request ran")
+
+    updated = dict(record)
+    updated.update(after)
+    updated["history"] = list(record.get("history", []))
+    updated["history"].append(entry)
+    return record_to_api(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
