@@ -101,6 +101,24 @@ MAX_PUNCH_DURATION = timedelta(hours=24)
 # 2026-W01-1 and we do not want those.
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# A month is written YYYY-MM. This is the contract's own pattern, handed to
+# Query(pattern=...) so "2026-13" or "20267" is a 422 before any code runs.
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+# R6: exactly these three statuses count as present. ABSENT and LEAVE do not.
+# The analytics pipelines test for membership in this list rather than for
+# absence from NON_PRESENT_STATUSES, because a stored status that is in
+# neither list must not silently count as a present day.
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+
+# R5: a half day counts as 0.5 of a present day, never as a full day.
+HALF_DAY_CREDIT = 0.5
+
+# R7: MongoDB's $dayOfWeek counts Sunday as 1 and Saturday as 7, so Monday to
+# Friday is exactly this range. Used inside the two analytics pipelines.
+FIRST_WORKING_WEEKDAY = 2
+LAST_WORKING_WEEKDAY = 6
+
 
 # --------------------------------------------------------------------------- #
 # 3. DATABASE, INDEXES AND THE APP
@@ -369,6 +387,239 @@ def build_attendance_query(
     sort = [("date", -1), ("emp_code", 1)]
     skip = (page - 1) * page_size
     return query, sort, skip, page_size
+
+
+def month_range(month: str):
+    """Turn "YYYY-MM" into the first and last day of that month, as strings.
+
+    The endpoint checks the shape with MONTH_PATTERN first, so by the time this
+    runs `month` is always a real calendar month.
+    """
+    year = int(month[0:4])
+    month_number = int(month[5:7])
+    first_day = date(year, month_number, 1)
+    # The last day of a month is one day before the first day of the next one.
+    if month_number == 12:
+        first_of_next_month = date(year + 1, 1, 1)
+    else:
+        first_of_next_month = date(year, month_number + 1, 1)
+    last_day = first_of_next_month - timedelta(days=1)
+    return first_day.isoformat(), last_day.isoformat()
+
+
+def count_working_days(start: str, end: str) -> int:
+    """R7: how many Monday-to-Friday days are in an inclusive YYYY-MM-DD range.
+
+    This is a calendar calculation over at most 31 days, not a loop over
+    documents, so it stays in Python on purpose. Every loop that touches
+    documents lives in an aggregation pipeline.
+    """
+    current = date.fromisoformat(start)
+    last = date.fromisoformat(end)
+    count = 0
+    while current <= last:
+        # weekday() is 0 for Monday and 6 for Sunday, so Mon-Fri is 0 to 4.
+        if current.weekday() <= 4:
+            count = count + 1
+        current = current + timedelta(days=1)
+    return count
+
+
+def build_monthly_pipeline(emp_code: str, month: str):
+    """The aggregation behind GET /analytics/employees/{emp_code}/monthly.
+
+    /admin/explain calls this same function, so the plan we explain can never
+    drift from the plan the endpoint really runs. Everything is done in the
+    database except `working_days`, which is a calendar count and is done in
+    Python by count_working_days().
+    """
+    first_day, last_day = month_range(month)
+    return [
+        # Stage 1 - only this employee, and only inside the month. `date` is a
+        # "YYYY-MM-DD" string and MongoDB compares strings in code-point order,
+        # which is the same order as the calendar, so $gte/$lte is a correct
+        # date range. This is exactly what the (emp_code, date) index serves.
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}},
+
+        # Stage 2 - the weekday number of the attendance date. $dateFromString
+        # turns "2026-07-06" into a real date; $dayOfWeek then returns 1 for
+        # Sunday through 7 for Saturday, so Mon-Fri is 2 to 6. onError and
+        # onNull return null instead of failing the request, so one odd stored
+        # date can never turn this endpoint into a 500.
+        {"$addFields": {"weekday": {"$dayOfWeek": {"$dateFromString": {
+            "dateString": "$date", "onError": None, "onNull": None}}}}},
+
+        # Stage 3 - what this one record is worth towards present_days (R5-R7):
+        # 1 for a presence status on a weekday, 0.5 for a half day, otherwise 0.
+        # It must be a separate $addFields, because a field added by one
+        # $addFields cannot be read by that same $addFields.
+        {"$addFields": {"present_credit": {"$cond": [
+            {"$and": [
+                {"$in": ["$status", PRESENT_STATUSES]},
+                {"$gte": ["$weekday", FIRST_WORKING_WEEKDAY]},
+                {"$lte": ["$weekday", LAST_WORKING_WEEKDAY]},
+            ]},
+            {"$cond": [
+                {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+                HALF_DAY_CREDIT, 1,
+            ]},
+            0,
+        ]}}},
+
+        # Stage 4 - one row for the whole employee, so every number is a plain
+        # sum. "_id": null means "put everything in one bucket". $ifNull makes
+        # a legacy document with no late_minutes count as 0 instead of making
+        # the whole sum null. Note there is no weekday test here: R7 says a
+        # weekend record still adds to the late and overtime totals.
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": "$present_credit"},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+
+        # Stage 5 - name the five numbers and drop the "_id": null. The endpoint
+        # reads these five names straight into its JSON response.
+        {"$project": {
+            "_id": 0,
+            "present_days": 1,
+            "leave_days": 1,
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "total_overtime_minutes": 1,
+        }},
+    ]
+
+
+def build_department_summary_pipeline(month: str, department=None):
+    """The aggregation behind GET /analytics/departments/summary.
+
+    It starts on the `employees` collection, not on `attendance_logs`. That one
+    decision is what makes somebody with no logs at all still appear in the
+    headcount (R9) and somebody who joined after the month stay out of it.
+
+    /admin/explain calls this same function.
+    """
+    first_day, last_day = month_range(month)
+
+    # R9: joined on or before the last day of the month. The optional
+    # department filter goes into the SAME $match below, so the database only
+    # ever has to touch one part of the collection.
+    who = {"joined_on": {"$lte": last_day}}
+    if department is not None:
+        # Exact match, case sensitive, so "Sales" and "sales" stay apart.
+        who["department"] = department
+
+    return [
+        # Stage 1 - the people in scope. `joined_on` is a "YYYY-MM-DD" string
+        # and compares correctly as text, and the joined_on index serves this.
+        {"$match": who},
+
+        # Stage 2 - this employee's logs for this month only. localField and
+        # foreignField do the emp_code equality (so the emp_code index is
+        # used) and the inner pipeline adds the month's date range; MongoDB
+        # allows both together from 5.0 onwards. Without the inner pipeline
+        # this would drag in every month the employee ever worked.
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [
+                {"$match": {"date": {"$gte": first_day, "$lte": last_day}}},
+            ],
+            "as": "logs",
+        }},
+
+        # Stage 3 - turn "one row per employee holding an array of logs" into
+        # "one row per log". preserveNullAndEmptyArrays keeps the employee who
+        # has no logs this month, as a single row with no `logs` field at all.
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+
+        # Stage 4 - the weekday of the log, same trick as the monthly pipeline.
+        {"$addFields": {"weekday": {"$dayOfWeek": {"$dateFromString": {
+            "dateString": "$logs.date", "onError": None, "onNull": None}}}}},
+
+        # Stage 5 - the four per-record numbers the group stage will sum.
+        # hours_value is the work_hours of this record, or null when the record
+        # must not be counted towards the average: a non-presence status, or
+        # a record that is still open and has no hours yet. $type is the test
+        # for "really holds a number", because a missing field compares as
+        # NOT equal to null, so $ne null would wrongly accept it.
+        {"$addFields": {
+            "present_credit": {"$cond": [
+                {"$and": [
+                    {"$in": ["$logs.status", PRESENT_STATUSES]},
+                    {"$gte": ["$weekday", FIRST_WORKING_WEEKDAY]},
+                    {"$lte": ["$weekday", LAST_WORKING_WEEKDAY]},
+                ]},
+                {"$cond": [
+                    {"$eq": [{"$ifNull": ["$logs.half_day", False]}, True]},
+                    HALF_DAY_CREDIT, 1,
+                ]},
+                0,
+            ]},
+            "hours_value": {"$cond": [
+                {"$and": [
+                    {"$in": ["$logs.status", PRESENT_STATUSES]},
+                    {"$in": [{"$type": "$logs.work_hours"},
+                             ["double", "int", "long", "decimal"]]},
+                ]},
+                "$logs.work_hours", None,
+            ]},
+            "late_flag": {"$cond": [
+                {"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]}, 1, 0]},
+            "leave_flag": {"$cond": [
+                {"$eq": ["$logs.status", "LEAVE"]}, 1, 0]},
+            "on_duty_flag": {"$cond": [
+                {"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]},
+        }},
+
+        # Stage 6 - how many of this department's records went into the hours
+        # average. It has to be its own $addFields, for the same reason as
+        # stage 3 of the monthly pipeline: a stage cannot read what it just
+        # added. $sum below ignores the nulls, which is exactly what we want.
+        {"$addFields": {"hours_counted": {"$cond": [
+            {"$in": [{"$type": "$hours_value"}, ["double", "int", "long", "decimal"]]},
+            1, 0]}}},
+
+        # Stage 7 - one row per department. headcount is the SIZE of the set of
+        # distinct emp_codes, because one employee appears once per log; the
+        # size itself is taken in the $project below. $addToSet is what makes
+        # that count correct no matter how many days somebody worked.
+        {"$group": {
+            "_id": "$department",
+            "members": {"$addToSet": "$emp_code"},
+            "present_days": {"$sum": "$present_credit"},
+            "hours_sum": {"$sum": "$hours_value"},
+            "hours_counted": {"$sum": "$hours_counted"},
+            "late_count": {"$sum": "$late_flag"},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$logs.late_minutes", 0]}},
+            "leave_count": {"$sum": "$leave_flag"},
+            "on_duty_count": {"$sum": "$on_duty_flag"},
+        }},
+
+        # Stage 8 - departments in ascending order, case sensitive, so "Sales"
+        # comes before "sales" because 'S' sorts before 's'.
+        {"$sort": {"_id": 1}},
+
+        # Stage 9 - rename _id to department, turn the member set into a count,
+        # and hand back only the eight fields the contract asks for.
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": {"$size": "$members"},
+            "present_days": 1,
+            "hours_sum": 1,
+            "hours_counted": 1,
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "leave_count": 1,
+            "on_duty_count": 1,
+        }},
+    ]
 
 
 def compute_hours_fields(punch_in, punch_out, date_str, shift_start, shift_end):
@@ -853,10 +1104,105 @@ def regularize(emp_code: str, date: str, body: RegularizeBody):
     return record_to_api(updated)
 
 
+# ------------------------------ analytics ---------------------------------- #
+
+@app.get("/analytics/employees/{emp_code}/monthly", tags=["analytics"])
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(pattern=MONTH_PATTERN),
+):
+    """One employee's month in numbers, from one aggregation pipeline.
+
+    Everything except working_days and attendance_pct is summed by MongoDB
+    over the STORED derived values; those two are calendar arithmetic.
+    """
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if employee is None:
+        raise HTTPException(404, "unknown emp_code")
+
+    first_day, last_day = month_range(month)
+    pipeline = build_monthly_pipeline(emp_code, month)
+    # A $group with no input rows returns NO rows at all, so an employee with
+    # no logs this month gives an empty list rather than a row of zeros.
+    rows = list(db.attendance_logs.aggregate(pipeline))
+    if rows == []:
+        totals = {
+            "present_days": 0,
+            "leave_days": 0,
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "total_overtime_minutes": 0,
+        }
+    else:
+        totals = rows[0]
+
+    # R7: a mid-month joiner is only expected to work from joined_on onwards.
+    # Both values are YYYY-MM-DD strings, so they compare correctly as text.
+    if employee["joined_on"] > first_day:
+        count_from = employee["joined_on"]
+    else:
+        count_from = first_day
+    working_days = count_working_days(count_from, last_day)
+
+    # A percentage of nothing is nothing, and the contract says null, not 0.
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        # R8: 2 decimals, half up. Decimal, never round(), and never MongoDB's
+        # $round, which rounds half to even.
+        percentage = Decimal(str(totals["present_days"])) / Decimal(working_days) * 100
+        attendance_pct = float(to_decimal_round(percentage, 2))
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": totals["present_days"],
+        "leave_days": totals["leave_days"],
+        "late_count": totals["late_count"],
+        "total_late_minutes": totals["total_late_minutes"],
+        "total_overtime_minutes": totals["total_overtime_minutes"],
+        "attendance_pct": attendance_pct,
+    }
+
+
+@app.get("/analytics/departments/summary", tags=["analytics"])
+def department_summary(
+    month: str = Query(pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+):
+    """One row per department for a month, from one aggregation pipeline."""
+    pipeline = build_department_summary_pipeline(month, department)
+    rows = list(db.employees.aggregate(pipeline))
+
+    items = []
+    for row in rows:
+        # The average is over RECORDS, not over per-employee averages, so the
+        # denominator is how many records carried a work_hours value at all.
+        if row["hours_counted"] == 0:
+            avg_work_hours = None
+        else:
+            # Round the sum first, to throw away float noise such as
+            # 113.24999999999999, then divide with Decimal and round once.
+            hours_sum = to_decimal_round(row["hours_sum"], 2)
+            average = hours_sum / Decimal(row["hours_counted"])
+            avg_work_hours = float(to_decimal_round(average, 2))
+        items.append({
+            "department": row["department"],
+            "headcount": row["headcount"],
+            "present_days": row["present_days"],
+            "avg_work_hours": avg_work_hours,
+            "late_count": row["late_count"],
+            "total_late_minutes": row["total_late_minutes"],
+            "leave_count": row["leave_count"],
+            "on_duty_count": row["on_duty_count"],
+        })
+
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
