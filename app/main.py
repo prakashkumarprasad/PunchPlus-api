@@ -15,6 +15,7 @@ What is stored in MongoDB is in DATA_MODEL.md.
 # --------------------------------------------------------------------------- #
 # 1. IMPORTS
 # --------------------------------------------------------------------------- #
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -22,8 +23,10 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -165,6 +168,15 @@ async def lifespan(app_instance: FastAPI):
         # Supports listing by date range in emp_code order, so the sort is free.
         db.attendance_logs.create_index(
             [("date", 1), ("emp_code", 1)], name="date_emp_code"
+        )
+        # GET /attendance sorts newest day first and emp_code ascending inside a
+        # day, which is date DESC + emp_code ASC. Walking date_emp_code
+        # backwards gives date DESC + emp_code DESC, so it does NOT match, and
+        # an unfiltered listing was measured doing a COLLSCAN plus a blocking
+        # sort of all 100,000 records. This twin of the index above supplies
+        # the exact order the endpoint asks for.
+        db.attendance_logs.create_index(
+            [("date", -1), ("emp_code", 1)], name="date_emp_code_desc"
         )
     except PyMongoError:
         # If MongoDB is not up yet we still start, so that GET /health can answer
@@ -1022,6 +1034,88 @@ def resolve_regularized_times(record: dict, new_status: str, date_str: str,
     return punch_in, punch_out
 
 
+def require_present(value, name: str):
+    """Raise the contract's 422 when a parameter the chosen endpoint needs is missing.
+
+    The contract describes this 422 as FastAPI's own validation body, where
+    `detail` is a LIST of error objects. Raising HTTPException would answer with
+    a single string instead, so a missing parameter is reported the same shape a
+    malformed one has.
+    """
+    if value is None:
+        raise RequestValidationError(errors=[{
+            "loc": ["query", name],
+            "msg": "Field required",
+            "type": "missing",
+        }])
+
+
+def check_date_argument(value, name: str):
+    """422 when a date parameter is not a real YYYY-MM-DD day.
+
+    GET /attendance and the trend endpoint both refuse such a value, so
+    /admin/explain refuses it too rather than explaining a query that the real
+    endpoint would never have run.
+    """
+    if value is not None and not is_valid_date_string(value):
+        raise RequestValidationError(errors=[{
+            "loc": ["query", name],
+            "msg": "value is not a real date in YYYY-MM-DD format",
+            "type": "value_error",
+        }])
+
+
+def build_explain_find(collection: str, query: dict, sort: list, skip: int, limit: int) -> dict:
+    """The explain command for a find, with the endpoint's own filter and sort.
+
+    This is the command form of `db.<collection>.find(...).sort(...).skip(...).
+    limit(...)`: MongoDB wants the sort as a document, so the list of pairs the
+    find uses is turned into one here.
+    """
+    sort_document = {}
+    for field_name, direction in sort:
+        sort_document[field_name] = direction
+
+    return {
+        "explain": {
+            "find": collection,
+            "filter": query,
+            "sort": sort_document,
+            "skip": skip,
+            "limit": limit,
+        },
+        # executionStats is what makes the server count the documents and keys
+        # it actually looked at. Without it the reply holds only the plan.
+        "verbosity": "executionStats",
+    }
+
+
+def build_explain_aggregate(collection: str, pipeline: list) -> dict:
+    """The explain command for an aggregation, on the pipeline the endpoint runs.
+
+    `cursor: {}` is required by the server even when only the plan is wanted,
+    exactly as aggregate() sends it.
+    """
+    return {
+        "explain": {
+            "aggregate": collection,
+            "pipeline": pipeline,
+            "cursor": {},
+        },
+        "verbosity": "executionStats",
+    }
+
+
+def explain_document_to_json(explain_document: dict) -> dict:
+    """Turn MongoDB's raw explain reply into plain JSON.
+
+    The reply holds BSON types - Int64, Decimal128, dates - which json.dumps
+    cannot write. bson.json_util writes them in extended JSON, so the values
+    stay exact and the text is still valid JSON.
+    """
+    return json.loads(json_util.dumps(explain_document))
+
+
 # --------------------------------------------------------------------------- #
 # 5. REQUEST MODELS
 # --------------------------------------------------------------------------- #
@@ -1585,7 +1679,92 @@ def department_trend(
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+# ---------------------------------- admin ----------------------------------- #
+
+@app.get("/admin/explain/{endpoint}", tags=["admin"])
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(DEFAULT_LEADERBOARD_LIMIT, ge=1, le=MAX_LEADERBOARD_LIMIT),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    trend_from: Optional[str] = Query(None, alias="from"),
+    trend_to: Optional[str] = Query(None, alias="to"),
+    page: int = Query(DEFAULT_PAGE, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """MongoDB's own explain output for one endpoint's main query.
+
+    Every branch calls the SAME builder function the real endpoint calls, so the
+    plan in the response is the plan the endpoint really runs. Nothing is
+    written: explain runs the query for the plan and the counters, then throws
+    the result away.
+
+    `from` and `to` are Python keywords, so they arrive as trend_from and
+    trend_to and Query(alias=...) maps them back to the contract's wire names.
+    """
+    # The find behind GET /attendance, filter, sort and paging included.
+    if endpoint == "attendance_list":
+        check_date_argument(date_from, "date_from")
+        check_date_argument(date_to, "date_to")
+        query, sort, skip, page_limit = build_attendance_query(
+            emp_code, date_from, date_to, status, page, page_size
+        )
+        collection = db.attendance_logs.name
+        command = build_explain_find(collection, query, sort, skip, page_limit)
+
+    # The five-stage aggregation behind GET /analytics/employees/{emp_code}/monthly.
+    elif endpoint == "employee_monthly":
+        require_present(emp_code, "emp_code")
+        require_present(month, "month")
+        collection = db.attendance_logs.name
+        command = build_explain_aggregate(
+            collection, build_monthly_pipeline(emp_code, month)
+        )
+
+    # The nine-stage aggregation behind GET /analytics/departments/summary. It
+    # starts on `employees`, so that is the collection explained.
+    elif endpoint == "department_summary":
+        require_present(month, "month")
+        collection = db.employees.name
+        command = build_explain_aggregate(
+            collection, build_department_summary_pipeline(month, department)
+        )
+
+    # The nine-stage aggregation behind GET /analytics/leaderboard/late.
+    elif endpoint == "late_leaderboard":
+        require_present(month, "month")
+        collection = db.attendance_logs.name
+        command = build_explain_aggregate(
+            collection, build_leaderboard_pipeline(month, limit, department)
+        )
+
+    # The fifteen-stage aggregation behind the trend endpoint. The Literal in
+    # the signature has already turned every other name into a 422, so this
+    # branch only ever sees department_trend.
+    else:
+        require_present(department, "department")
+        require_present(trend_from, "from")
+        require_present(trend_to, "to")
+        check_date_argument(trend_from, "from")
+        check_date_argument(trend_to, "to")
+        collection = db.employees.name
+        command = build_explain_aggregate(
+            collection, build_trend_pipeline(department, trend_from, trend_to)
+        )
+
+    explain_document = db.command(command)
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": explain_document_to_json(explain_document),
+    }
