@@ -18,8 +18,9 @@ uvicorn app.main:app --port 8000
 `MONGO_URI` and `MONGO_DB` are read from the environment; a local `.env` file is used if it
 exists, but it never overrides a real environment variable. MongoDB **6.0 or newer**
 (tested on 7.0.43). Swagger UI is at `http://localhost:8000/docs`; `GET /health` returns
-503 when MongoDB is down. All six indexes are created at start-up, so there is no manual
-step.
+503 when MongoDB is down. All five indexes are created at start-up, and `/health`
+re-creates anything missing, so there is no manual step even if the app started while
+MongoDB was down.
 
 ## The endpoints
 

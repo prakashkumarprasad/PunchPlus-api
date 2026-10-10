@@ -2,11 +2,11 @@
 
 > Draft notes only - **rewrite all five in your own voice before submitting.**
 
-1. **Indexes.** Six. `employees`: unique `emp_code`, `(department, emp_code)`,
+1. **Indexes.** Five. `employees`: unique `emp_code`, `(department, emp_code)`,
    `joined_on`. `attendance_logs`: unique `(emp_code, date)`, which stops two punch-ins on
-   one day, plus `(date, emp_code)` and `(date desc, emp_code)` for the month scans and
-   the listing sort. Rejected: a covering index of every analytics field - it saves 9,833
-   document reads but doubles each punch-in's write cost.
+   one day, and `(date desc, emp_code)`, which gives the listing its sort. Rejected: a
+   covering index of every analytics field - it would save 9,833 document reads but
+   doubles each punch-in's write cost.
 
 2. **Punch-in race.** Neither checks anything first. Both call `insert_one`, and the
    unique `(emp_code, date)` index makes the insert and the uniqueness test one atomic

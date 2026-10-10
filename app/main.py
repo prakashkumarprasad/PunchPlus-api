@@ -147,41 +147,45 @@ client = MongoClient(
 db = client[MONGO_DB]
 
 
+def ensure_indexes():
+    """Create every index this app needs, in one place.
+
+    Calling this more than once is harmless: MongoDB keeps an index that is
+    already there, so the second call changes nothing. That is what lets the
+    start-up and GET /health both call it.
+    """
+    # A unique index on emp_code is what makes "exactly one create wins" true.
+    db.employees.create_index("emp_code", unique=True, name="emp_code_unique")
+    # Supports filtering employees by department, read in emp_code order.
+    db.employees.create_index(
+        [("department", 1), ("emp_code", 1)], name="department_emp_code"
+    )
+    # Supports the headcount questions: who had joined by a given day (R9).
+    db.employees.create_index("joined_on", name="joined_on")
+
+    # At most one record per (emp_code, date). This unique index is what turns
+    # a duplicate punch-in into a DuplicateKeyError instead of a second row.
+    db.attendance_logs.create_index(
+        [("emp_code", 1), ("date", 1)], unique=True, name="emp_code_date_unique"
+    )
+    # GET /attendance sorts by date going down and emp_code going up. An index
+    # can only supply a sort when its own order matches, and walking an index
+    # backwards flips every field in it, so this order needs its own index.
+    # It is also used by the month range scans in the analytics.
+    db.attendance_logs.create_index(
+        [("date", -1), ("emp_code", 1)], name="date_emp_code_desc"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    """Create every index once, when the app starts. Safe to run again."""
+    """Create the indexes at start-up. Safe to run again."""
     try:
-        # A unique index on emp_code is what makes "exactly one create wins" true.
-        db.employees.create_index("emp_code", unique=True, name="emp_code_unique")
-        # Supports filtering employees by department, read in emp_code order.
-        db.employees.create_index(
-            [("department", 1), ("emp_code", 1)], name="department_emp_code"
-        )
-        # Supports the headcount questions: who had joined by a given day (R9).
-        db.employees.create_index("joined_on", name="joined_on")
-
-        # At most one record per (emp_code, date). This unique index is what turns
-        # a duplicate punch-in into a DuplicateKeyError instead of a second row.
-        db.attendance_logs.create_index(
-            [("emp_code", 1), ("date", 1)], unique=True, name="emp_code_date_unique"
-        )
-        # Supports listing by date range in emp_code order, so the sort is free.
-        db.attendance_logs.create_index(
-            [("date", 1), ("emp_code", 1)], name="date_emp_code"
-        )
-        # GET /attendance sorts newest day first and emp_code ascending inside a
-        # day, which is date DESC + emp_code ASC. Walking date_emp_code
-        # backwards gives date DESC + emp_code DESC, so it does NOT match, and
-        # an unfiltered listing was measured doing a COLLSCAN plus a blocking
-        # sort of all 100,000 records. This twin of the index above supplies
-        # the exact order the endpoint asks for.
-        db.attendance_logs.create_index(
-            [("date", -1), ("emp_code", 1)], name="date_emp_code_desc"
-        )
+        ensure_indexes()
     except PyMongoError:
-        # If MongoDB is not up yet we still start, so that GET /health can answer
-        # 503 as the contract requires. Refusing to start would mean the runner
-        # gets a connection error instead of a 503.
+        # MongoDB is not up yet, so we still start. GET /health then answers
+        # 503 as the contract requires, and it calls ensure_indexes() again on
+        # every call, so the indexes appear as soon as MongoDB is reachable.
         pass
 
     yield
@@ -753,13 +757,12 @@ def build_trend_pipeline(department: str, date_from: str, date_to: str):
     first = date.fromisoformat(date_from)
     last = date.fromisoformat(date_to)
 
-    # The day series is built from an offset list. $densify was measured first
-    # and REJECTED, for a reason worth knowing: on 7.0.43 it does fill a range
-    # from zero input documents (so the plan's worry is unfounded), but every
-    # document it generates carries ONLY the densified field, and neither
-    # partitionByFields nor anything else makes it copy the seed's other
-    # fields. join_dates and emp_codes would not survive it. $unwind does carry
-    # them, so the skeleton is built with $range.
+    # The day series is built from a list of day numbers instead of from the
+    # $densify stage, because $densify only copies the field it is filling in.
+    # Every row it adds would come back holding just that date, so the
+    # join_dates and emp_codes we need on each day would be gone. $unwind keeps
+    # every other field, so $range plus $unwind gives the same calendar and
+    # still carries what the later stages read.
     day_count = (last - first).days + 1
 
     # $dateAdd needs a real Date to start from. The date a punch is stored
@@ -835,11 +838,11 @@ def build_trend_pipeline(department: str, date_from: str, date_to: str):
             }}},
         }},
 
-        # Stage 9 - this day's attendance records for this department. The
-        # plain {"date": "$$day_text"} form matches NOTHING, because $$ is only
-        # substituted inside expression contexts, so the day has to be compared
-        # with $expr. Measured on 7.0.43: that form is still an IXSCAN on the
-        # (date, emp_code) index.
+        # Stage 9 - this day's attendance records for this department. The day
+        # has to be compared inside an expression: $$ is only substituted in
+        # expression contexts, so a plain {"date": "$$day_text"} would be read as
+        # a literal string and would match nothing at all. Comparing with $expr
+        # still lets the date index do the work.
         {"$lookup": {
             "from": "attendance_logs",
             "let": {"day_text": "$date", "codes": "$emp_codes"},
@@ -1006,6 +1009,18 @@ def resolve_regularized_times(record: dict, new_status: str, date_str: str,
     # A presence status needs a punch_in: sent here, or already stored.
     if sent_punch_in is not None:
         punch_in = truncate_seconds(ms_to_dt(sent_punch_in))
+        # A punch-in the client sent must still belong to this record's own
+        # attendance day, otherwise the correction would move the record to a
+        # different day and it would stop matching its own (emp_code, date) key.
+        # Only a punch-in that was actually sent can do that, so the check lives
+        # here. An old record whose STORED punch-in no longer matches its date
+        # must still be correctable: a correction that does not touch the
+        # punch-in cannot break the key, so it is none of its business.
+        new_date = attendance_date_for(
+            punch_in, employee["shift_start"], employee["shift_end"]
+        )
+        if new_date != date_str:
+            raise HTTPException(422, "punch_in does not belong to this attendance date")
     elif stored_punch_in is not None:
         punch_in = stored_punch_in
     else:
@@ -1015,15 +1030,6 @@ def resolve_regularized_times(record: dict, new_status: str, date_str: str,
         punch_out = truncate_seconds(ms_to_dt(sent_punch_out))
     else:
         punch_out = stored_punch_out
-
-    # R1 again: correcting a punch time must not move the record to another day.
-    # This is the overnight-aware form, because attendance_date_for knows the
-    # employee's shift.
-    new_date = attendance_date_for(
-        punch_in, employee["shift_start"], employee["shift_end"]
-    )
-    if new_date != date_str:
-        raise HTTPException(422, "punch_in does not belong to this attendance date")
 
     if punch_out is not None:
         if punch_out <= punch_in:
@@ -1208,6 +1214,13 @@ def health():
     """200 only when MongoDB answers a ping, otherwise 503."""
     try:
         client.admin.command("ping")
+        # If the app started while MongoDB was down, the indexes were never
+        # created, and without them two identical punch-ins would both succeed
+        # instead of one of them getting a 409. Creating them here means the app
+        # repairs itself on the next health check, with no restart. The calls
+        # are free once the indexes exist, and a failure here is caught by the
+        # same except as a failed ping, so it can never become a 500.
+        ensure_indexes()
     except PyMongoError:
         raise HTTPException(503, "MongoDB is not reachable")
     return {"status": "ok"}
