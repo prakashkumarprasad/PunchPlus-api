@@ -119,6 +119,15 @@ HALF_DAY_CREDIT = 0.5
 FIRST_WORKING_WEEKDAY = 2
 LAST_WORKING_WEEKDAY = 6
 
+# The late leaderboard's page size. `limit` caps the RANK, not the number of
+# rows, so a tie at the cutoff can return more rows than the limit.
+DEFAULT_LEADERBOARD_LIMIT = 10
+MAX_LEADERBOARD_LIMIT = 50
+
+# The trend returns exactly one row per calendar day, so the range has to be
+# bounded. 92 rows is the most the contract allows; 93 is a 422.
+MAX_TREND_ROWS = 92
+
 
 # --------------------------------------------------------------------------- #
 # 3. DATABASE, INDEXES AND THE APP
@@ -618,6 +627,292 @@ def build_department_summary_pipeline(month: str, department=None):
             "total_late_minutes": 1,
             "leave_count": 1,
             "on_duty_count": 1,
+        }},
+    ]
+
+
+def build_leaderboard_pipeline(month: str, limit: int, department=None):
+    """The aggregation behind GET /analytics/leaderboard/late.
+
+    Two things this has to get right, both stated in the contract:
+
+    * the rank is STANDARD COMPETITION ranking, so ties share a rank and the
+      next rank is skipped (1, 2, 2, 4). MongoDB's $rank does exactly that
+      inside $setWindowFields; $denseRank would give 1, 2, 2, 3.
+    * `limit` caps the RANK, not the number of rows. So it is applied as a
+      $match on `rank` AFTER ranking, never as a $limit.
+
+    /admin/explain calls this same function.
+    """
+    first_day, last_day = month_range(month)
+
+    # The department filter goes INSIDE the $lookup, which is what makes the
+    # ranking happen inside that department only: rows for other departments
+    # are dropped before the window is computed, not after.
+    employee_filter = {}
+    if department is not None:
+        # Exact match, case sensitive, so "Sales" and "sales" stay apart.
+        employee_filter["department"] = department
+    lookup_pipeline = []
+    if employee_filter:
+        lookup_pipeline.append({"$match": employee_filter})
+
+    return [
+        # Stage 1 - the month's records. `date` is a "YYYY-MM-DD" string and
+        # strings compare in calendar order, so this is a plain range on the
+        # (date, emp_code) index.
+        {"$match": {"date": {"$gte": first_day, "$lte": last_day}}},
+
+        # Stage 2 - one row per employee. $ifNull covers a legacy record that
+        # has no late_minutes at all.
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+
+        # Stage 3 - only employees who were actually late. Doing it here, before
+        # the lookup, means somebody with no late minutes never enters the
+        # ranking at all.
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+
+        # Stage 4 - the employee's name and department. `_id` is the emp_code
+        # (it is the $group key), and emp_code has a unique index, so this is
+        # an indexed lookup rather than a scan.
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "pipeline": lookup_pipeline,
+            "as": "employee",
+        }},
+
+        # Stage 5 - one row per employee document. This is also what DROPS the
+        # logs of employees who do not exist: the lookup returned an empty array
+        # for them, and $unwind with no preserve flag throws the row away.
+        {"$unwind": "$employee"},
+
+        # Stage 6 - the rank. $rank is competition ranking: equal sort keys get
+        # equal ranks and the following rank is skipped. There is no partition
+        # here, so this is one window over the whole (already department-scoped)
+        # set. The window is not partitionable at this point because ranking
+        # has to happen after the department filter, not before.
+        {"$setWindowFields": {
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+
+        # Stage 7 - limit AFTER ranking. Two employees tied at rank 2 both come
+        # back for limit=2, so the response can be longer than the limit. This
+        # is deliberately NOT a $limit.
+        {"$match": {"rank": {"$lte": limit}}},
+
+        # Stage 8 - the row order the contract asks for: most late minutes
+        # first, and emp_code ascending to break a tie. $setWindowFields does
+        # not promise any order, so this sort is needed as well as the one
+        # inside the window.
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+
+        # Stage 9 - the six response fields. `_id` is the emp_code, so it is
+        # renamed rather than dropped.
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$employee.name",
+            "department": "$employee.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+
+
+def build_trend_pipeline(department: str, date_from: str, date_to: str):
+    """The aggregation behind GET /analytics/departments/{department}/trend.
+
+    The hard part is not the sums, it is that the answer must contain exactly
+    one row per calendar day, weekends and days with no records included. That
+    is a GAP-FILLING problem, and it is solved in the database, never with a
+    loop in Python.
+
+    /admin/explain calls this same function.
+    """
+    first = date.fromisoformat(date_from)
+    last = date.fromisoformat(date_to)
+
+    # The day series is built from an offset list. $densify was measured first
+    # and REJECTED, for a reason worth knowing: on 7.0.43 it does fill a range
+    # from zero input documents (so the plan's worry is unfounded), but every
+    # document it generates carries ONLY the densified field, and neither
+    # partitionByFields nor anything else makes it copy the seed's other
+    # fields. join_dates and emp_codes would not survive it. $unwind does carry
+    # them, so the skeleton is built with $range.
+    day_count = (last - first).days + 1
+
+    # $dateAdd needs a real Date to start from. The date a punch is stored
+    # against is an IST calendar day, but this Date is only ever stepped
+    # through one day at a time and printed back out, so UTC midnight is a
+    # fine anchor and keeps the arithmetic obvious.
+    range_start = datetime(first.year, first.month, first.day, tzinfo=UTC)
+
+    return [
+        # Stage 1 - the people in this department. The endpoint answers 404
+        # before it calls this, so there is always at least one document here.
+        # Starting from `employees` rather than from `attendance_logs` is what
+        # makes the day series possible: it does not depend on anybody having
+        # any logs at all.
+        {"$match": {"department": department}},
+
+        # Stage 2 - their join dates as real Dates, so they can be compared
+        # with the day being built. onError/onNull so one odd joined_on cannot
+        # turn the whole request into a 500.
+        {"$addFields": {"joined_on_date": {"$dateFromString": {
+            "dateString": "$joined_on", "onError": None, "onNull": None}}}},
+
+        # Stage 3 - collapse to ONE document holding every join date and every
+        # emp_code. From here on the pipeline never needs the employees
+        # collection again.
+        {"$group": {
+            "_id": None,
+            "join_dates": {"$push": "$joined_on_date"},
+            "emp_codes": {"$push": "$emp_code"},
+        }},
+
+        # Stage 4 - one offset per calendar day in the range: 0, 1, 2, 3 ...
+        # This is the gap filling. It does not look at any attendance record,
+        # so it produces the same series for a month with no records at all,
+        # and it cannot come up empty.
+        {"$project": {
+            "_id": 0,
+            "day_offset": {"$range": [0, day_count]},
+            "join_dates": 1,
+            "emp_codes": 1,
+        }},
+
+        # Stage 5 - split the offsets into one document per day. $unwind keeps
+        # every other field on each new document, which is the whole reason
+        # this is a $range skeleton and not a $densify.
+        {"$unwind": "$day_offset"},
+
+        # Stage 6 - the real Date for this offset, and the calendar date as
+        # the string attendance_logs.date holds. One day per row, weekends
+        # included.
+        {"$addFields": {"day": {"$dateAdd": {
+            "startDate": range_start, "unit": "day", "amount": "$day_offset"}}}},
+        # ...and that date as a string. It has to be a separate $addFields,
+        # because a stage cannot read a field it just added.
+        {"$addFields": {"date": {"$dateToString": {
+            "date": "$day", "format": "%Y-%m-%d", "timezone": "UTC"}}}},
+
+        # Stage 7 - the weekday number, so stage 8 can test Mon-Fri.
+        {"$addFields": {"weekday": {"$dayOfWeek": {"$dateFromString": {
+            "dateString": "$date", "onError": None, "onNull": None}}}}},
+
+        # Stage 8 - Mon-Fri, and the headcount for this day (R9: employees who
+        # had joined by this day). join_dates was carried from stage 3, so the
+        # test is a straight comparison against this day's Date.
+        {"$addFields": {
+            "is_working_day": {"$and": [
+                {"$gte": ["$weekday", FIRST_WORKING_WEEKDAY]},
+                {"$lte": ["$weekday", LAST_WORKING_WEEKDAY]},
+            ]},
+            "headcount": {"$size": {"$filter": {
+                "input": "$join_dates",
+                "cond": {"$lte": ["$$this", "$day"]},
+            }}},
+        }},
+
+        # Stage 9 - this day's attendance records for this department. The
+        # plain {"date": "$$day_text"} form matches NOTHING, because $$ is only
+        # substituted inside expression contexts, so the day has to be compared
+        # with $expr. Measured on 7.0.43: that form is still an IXSCAN on the
+        # (date, emp_code) index.
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"day_text": "$date", "codes": "$emp_codes"},
+            "pipeline": [
+                {"$match": {"$expr": {"$eq": ["$date", "$$day_text"]}}},
+                {"$match": {"$expr": {"$in": ["$emp_code", "$$codes"]}}},
+                # Score each log inside the lookup, so the outer pipeline only
+                # has to add them up. Note there is NO weekday test here: the
+                # contract counts a presence record on any day, weekday or
+                # weekend, unlike present_days in the monthly summary.
+                {"$addFields": {
+                    "present_credit": {"$cond": [
+                        {"$in": ["$status", PRESENT_STATUSES]},
+                        {"$cond": [
+                            {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+                            HALF_DAY_CREDIT, 1,
+                        ]},
+                        0,
+                    ]},
+                    "late_flag": {"$cond": [
+                        {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]},
+                }},
+            ],
+            "as": "day_logs",
+        }},
+
+        # Stage 10 - one row per log. preserveNullAndEmptyArrays keeps a day
+        # with no records, which is the whole point of the gap filling.
+        {"$unwind": {"path": "$day_logs", "preserveNullAndEmptyArrays": True}},
+
+        # Stage 11 - back to one row per day. $first carries the three values
+        # that are identical for every log of the same day; $ifNull turns a
+        # day with no logs into zeros rather than dropping it.
+        {"$group": {
+            "_id": "$day",
+            "date": {"$first": "$date"},
+            "is_working_day": {"$first": "$is_working_day"},
+            "headcount": {"$first": "$headcount"},
+            "present_count": {"$sum": {"$ifNull": ["$day_logs.present_credit", 0]}},
+            "late_count": {"$sum": {"$ifNull": ["$day_logs.late_flag", 0]}},
+        }},
+
+        # Stage 12 - present_count / headcount, and ONLY on a working day with
+        # somebody employed. A weekend has no rate, and a working day with no
+        # records is 0.0 rather than null. Left UNROUNDED on purpose: the
+        # moving average must average the exact rates, and Python rounds once
+        # at the end.
+        {"$addFields": {"attendance_rate_raw": {"$cond": [
+            {"$and": [
+                {"$eq": ["$is_working_day", True]},
+                {"$gt": ["$headcount", 0]},
+            ]},
+            {"$divide": ["$present_count", "$headcount"]},
+            None,
+        ]}}},
+
+        # Stage 13 - the 7 day moving average. The window is this row plus the
+        # six before it, and it can only see rows inside the requested range
+        # because the series starts at `from`, which is exactly what the
+        # contract asks for. $avg ignores nulls, so a weekend is left out of
+        # the average but does NOT shorten the window, and an all-null window
+        # gives null.
+        {"$setWindowFields": {
+            "sortBy": {"_id": 1},
+            "output": {"moving_avg_raw": {
+                "$avg": "$attendance_rate_raw",
+                "window": {"documents": [-6, 0]},
+            }},
+        }},
+
+        # Stage 14 - chronological order. $setWindowFields does not promise
+        # the order of what it returns.
+        {"$sort": {"_id": 1}},
+
+        # Stage 15 - hand back the raw numbers. Python rounds them, so that the
+        # rounding happens in exactly one place.
+        {"$project": {
+            "_id": 0,
+            "date": 1,
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": 1,
+            "late_count": 1,
+            "attendance_rate_raw": 1,
+            "moving_avg_raw": 1,
         }},
     ]
 
@@ -1201,9 +1496,96 @@ def department_summary(
     return {"month": month, "items": items}
 
 
+@app.get("/analytics/leaderboard/late", tags=["analytics"])
+def late_leaderboard(
+    month: str = Query(pattern=MONTH_PATTERN),
+    limit: int = Query(DEFAULT_LEADERBOARD_LIMIT, ge=1, le=MAX_LEADERBOARD_LIMIT),
+    department: Optional[str] = None,
+):
+    """Rank employees by late minutes in a month, ties sharing a rank.
+
+    Every number here is an integer count or an integer sum of integers, so
+    there is nothing to round: R8 applies to the trend's rates instead.
+    """
+    pipeline = build_leaderboard_pipeline(month, limit, department)
+    rows = list(db.attendance_logs.aggregate(pipeline))
+
+    items = []
+    for row in rows:
+        items.append({
+            "rank": row["rank"],
+            "emp_code": row["emp_code"],
+            "name": row["name"],
+            "department": row["department"],
+            "total_late_minutes": row["total_late_minutes"],
+            "late_count": row["late_count"],
+        })
+
+    return {"month": month, "items": items}
+
+
+@app.get("/analytics/departments/{department}/trend", tags=["analytics"])
+def department_trend(
+    department: str,
+    date_from: str = Query(alias="from"),
+    date_to: str = Query(alias="to"),
+):
+    """One row per calendar day for a department, weekends and gaps included.
+
+    `from` and `to` are Python keywords, so the arguments are called
+    date_from and date_to and Query(alias=...) maps them back to the wire
+    names the contract uses.
+    """
+    # Argument problems are answered before state problems, so a malformed
+    # range is a 422 even for a department nobody has ever heard of.
+    if not is_valid_date_string(date_from):
+        raise HTTPException(422, "from must be a real date in YYYY-MM-DD format")
+    if not is_valid_date_string(date_to):
+        raise HTTPException(422, "to must be a real date in YYYY-MM-DD format")
+    if date_to < date_from:
+        raise HTTPException(422, "to must not be before from")
+    # The range is counted in ROWS, both ends included, because the response
+    # has one row per calendar day. 92 rows is allowed, 93 is not.
+    row_count = (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1
+    if row_count > MAX_TREND_ROWS:
+        raise HTTPException(422, f"the range must not exceed {MAX_TREND_ROWS} days")
+
+    # A department nobody is in is a 404, which is the one 404 in the
+    # analytics. Department names are case sensitive, so "engineering" is not
+    # "Engineering" and is a 404 too.
+    if db.employees.find_one({"department": department}) is None:
+        raise HTTPException(404, "unknown department")
+
+    pipeline = build_trend_pipeline(department, date_from, date_to)
+    rows = list(db.employees.aggregate(pipeline))
+
+    items = []
+    for row in rows:
+        # R8: rates are 4 decimals, half up. MongoDB's $round would round half
+        # to even, and rounding inside the pipeline would also feed rounded
+        # values into the moving average.
+        if row["attendance_rate_raw"] is None:
+            attendance_rate = None
+        else:
+            attendance_rate = float(to_decimal_round(row["attendance_rate_raw"], 4))
+        if row["moving_avg_raw"] is None:
+            moving_avg_7d = None
+        else:
+            moving_avg_7d = float(to_decimal_round(row["moving_avg_raw"], 4))
+        items.append({
+            "date": row["date"],
+            "is_working_day": row["is_working_day"],
+            "headcount": row["headcount"],
+            "present_count": row["present_count"],
+            "late_count": row["late_count"],
+            "attendance_rate": attendance_rate,
+            "moving_avg_7d": moving_avg_7d,
+        })
+
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
